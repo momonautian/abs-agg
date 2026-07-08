@@ -1,0 +1,70 @@
+{
+  "id": "storygraph",
+  "name": "StoryGraph",
+  "available": true,
+  "description": "Fetches metadata from StoryGraph, a book recommendation and tracking platform.",
+  "url": "https://app.thestorygraph.com",
+  "parameters": [
+    {
+      "name": "booklimit",
+      "required": false,
+      "validation": {
+        "type": "int",
+        "min": 1,
+        "max": 5
+      },
+      "description": "Maximum books to return. Product of booklimit and editionlimit may not exceed 10. If not specified, defaults to 3."
+    },
+    {
+      "name": "editionlimit",
+      "required": false,
+      "validation": {
+        "type": "int",
+        "min": 1,
+        "max": 3
+      },
+      "description": "Maximum editions per book to return. Product of booklimit and editionlimit may not exceed 10. If not specified, defaults to 1."
+    },
+    {
+      "name": "lang",
+      "required": false,
+      "validation": {
+        "type": "enum",
+        "values": [
+          "all",
+          "english"
+        ]
+      },
+      "description": "Language of the audiobook searched for. If not specified, defaults to all (search in all languages)."
+    },
+    {
+      "name": "pubyear",
+      "required": false,
+      "validation": {
+        "type": "enum",
+        "values": [
+          "original",
+          "edition"
+        ]
+      },
+      "description": "Which publication year to use for the publishedYear field in the returned metadata. If not specified, defaults to edition (the year the edition was first published)."
+    }
+  ],
+  "returnedFields": [
+    "title",
+    "subtitle",
+    "author",
+    "narrator",
+    "publisher",
+    "publishedYear",
+    "description",
+    "cover",
+    "isbn",
+    "bookId",
+    "genres",
+    "series",
+    "language",
+    "duration"
+  ],
+  "comments": ["Uses the public search page of StoryGraph to fetch metadata, since there does not appear to be a public API available for this purpose."]
+}
