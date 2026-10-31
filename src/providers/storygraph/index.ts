@@ -29,7 +29,7 @@ export default class StoryGraphProvider extends BaseProvider {
       headers: {
         ...this.getHeaders({
           accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          includeCookie: false
+          includeCookie: true
         }),
         'Upgrade-Insecure-Requests': '1'
       }
@@ -64,7 +64,7 @@ export default class StoryGraphProvider extends BaseProvider {
 
     await this.getSessionCookie()
 
-    const searchResults = await this.searchBooks(title, author, bookLimit)
+    const searchResults = await this.searchBooksWithRetry(title, author, bookLimit)
     if (searchResults.length === 0) {
       return []
     }
@@ -103,6 +103,26 @@ export default class StoryGraphProvider extends BaseProvider {
     return allResults
   }
 
+  async searchBooksWithRetry(title: string, author: string | null, bookLimit: number): Promise<StoryGraphSearchResult[]> {
+  const maxRetries = 3
+  let lastError: Error | null = null
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await this.searchBooks(title, author, bookLimit)
+    } catch (error) {
+      lastError = error as Error
+      if (attempt < maxRetries - 1) {
+        const delay = 5000 * Math.pow(2, attempt) + Math.random() * 2000
+        console.log(`Attempt ${attempt + 1} failed. Retrying in ${Math.round(delay)}ms...`)
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+  }
+  
+  throw lastError
+}
+
   private async searchBooks(
     title: string,
     author: string | null,
@@ -119,11 +139,12 @@ export default class StoryGraphProvider extends BaseProvider {
 
     const searchRes = await httpClient.get<string>(searchUrl, {
       headers: this.getHeaders({
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        includeCookie: true
       })
     })
     // sleep for a short duration to avoid hitting rate limits
-    await new Promise(resolve => setTimeout(resolve, 100))
+    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 1500))
 
     if (searchRes.status === 404) {
       console.warn(`No search results found for query: "${searchString}"`)
@@ -165,6 +186,30 @@ export default class StoryGraphProvider extends BaseProvider {
     return results
   }
 
+  private async fetchEditionsForBooksWithRetry(
+    bookIds: string[],
+    editionLimit: number,
+    language: string,
+    pubYear: string): Promise<BookMetadata[]> {
+  const maxRetries = 3
+  let lastError: Error | null = null
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await this.fetchEditionsForBooks(bookIds, editionLimit, language, pubYear)
+    } catch (error) {
+      lastError = error as Error
+      if (attempt < maxRetries - 1) {
+        const delay = 5000 * Math.pow(2, attempt) + Math.random() * 2000
+        console.log(`Attempt ${attempt + 1} failed. Retrying in ${Math.round(delay)}ms...`)
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+  }
+  
+  throw lastError
+}
+
   private async fetchEditionsForBooks(
     bookIds: string[],
     editionLimit: number,
@@ -192,11 +237,12 @@ export default class StoryGraphProvider extends BaseProvider {
           accept:
             'text/javascript, application/javascript, application/ecmascript, application/x-ecmascript, */*; q=0.01',
           referer: `${this.baseUrl}/books/${bookId}/editions`,
-          xRequestedWith: true
+          xRequestedWith: true,
+          includeCookie: true
         })
       })
       // sleep for a short duration to avoid hitting rate limits
-      await new Promise(resolve => setTimeout(resolve, 100))
+    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000))
 
       if (searchRes.status === 404) {
         console.warn(`No editions found for bookId: "${bookId}"`)
@@ -407,20 +453,38 @@ export default class StoryGraphProvider extends BaseProvider {
     return configParam
   }
 
+  private getRandomUserAgent(): string {
+    const versions = [
+      'Chrome/120.0.0.0',
+      'Chrome/119.0.0.0', 
+      'Chrome/118.0.0.0'
+    ]
+    const version = versions[Math.floor(Math.random() * versions.length)]
+    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ${version} Safari/537.36`
+  }
+
   private getHeaders(options?: {
     accept?: string
     includeCookie?: boolean
     referer?: string
     xRequestedWith?: boolean
   }): Record<string, string> {
-    const headers: Record<string, string> = {
-      Accept: options?.accept ?? 'application/json',
-      'Accept-Encoding': 'gzip, deflate, br',
-      Host: 'app.thestorygraph.com',
-      'User-Agent': 'Mozilla/5.0 Gecko/20100101 Firefox/152.0',
-      Cookie: options?.includeCookie === false ? '' : this.sessionCookie || '',
-      Referer: options?.referer ?? 'https://app.thestorygraph.com/'
-    }
+  const headers: Record<string, string> = {
+    'Accept': options?.accept ?? 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="120"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Upgrade-Insecure-Requests': '1',
+    'Host': 'app.thestorygraph.com',
+    'User-Agent': this.getRandomUserAgent(),
+    Cookie: options?.includeCookie === false ? '' : this.sessionCookie || '',
+    Referer: options?.referer ?? 'https://www.google.com/'
+  }
 
     if (options?.xRequestedWith) {
       headers['X-Requested-With'] = 'XMLHttpRequest'
