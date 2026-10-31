@@ -122,6 +122,8 @@ export default class StoryGraphProvider extends BaseProvider {
         accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       })
     })
+    // sleep for a short duration to avoid hitting rate limits
+    await new Promise(resolve => setTimeout(resolve, 100))
 
     if (searchRes.status === 404) {
       console.warn(`No search results found for query: "${searchString}"`)
@@ -193,6 +195,8 @@ export default class StoryGraphProvider extends BaseProvider {
           xRequestedWith: true
         })
       })
+      // sleep for a short duration to avoid hitting rate limits
+      await new Promise(resolve => setTimeout(resolve, 100))
 
       if (searchRes.status === 404) {
         console.warn(`No editions found for bookId: "${bookId}"`)
@@ -358,7 +362,7 @@ export default class StoryGraphProvider extends BaseProvider {
 
   private validateParameters(
     title: string,
-    author: string | null,
+    _author: string | null,
     booklimit: number,
     editionlimit: number,
     language: string,
