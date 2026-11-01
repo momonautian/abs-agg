@@ -1,12 +1,12 @@
 import { BaseProvider } from '../BaseProvider'
 import { SeriesMetadata, BookMetadata, ParsedParameters, ProviderConfig } from '../../types'
 import { normalizeBookMetadata } from '../../utils/helpers'
-import { httpClient } from '../../utils/httpClient'
 import { dbManager } from '../../database/manager'
 import { StoryGraphSearchResult } from './types'
 import fs from 'fs'
 import path from 'path'
 import * as cheerio from 'cheerio'
+import { solveWithFlareSolverr, cookiesToHeader, FlareSolverrCookie } from './flareSolverr'
 
 const configPath = path.join(__dirname, 'config.json')
 const config: ProviderConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
@@ -15,38 +15,92 @@ export default class StoryGraphProvider extends BaseProvider {
   private readonly baseUrl = 'https://app.thestorygraph.com'
   private readonly searchUrl = `${this.baseUrl}/search`
   private readonly editionsUrl = `${this.baseUrl}/filter-editions`
-  private sessionCookie: string | null = null
+  
+  // FlareSolverr gives us a cf_clearance cookie + user agent
+  private sessionCookies: FlareSolverrCookie[] | null = null
+  private cachedUserAgent: string | null = null
 
   constructor() {
     super(config)
   }
 
-  private async getSessionCookie(): Promise<string> {
-    if (this.sessionCookie) {
-      return this.sessionCookie
-    }
-    const resp = await httpClient.get(this.baseUrl, {
-      headers: {
-        ...this.getHeaders({
-          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          includeCookie: true
-        }),
-        'Upgrade-Insecure-Requests': '1'
-      }
-    })
-
-    if (resp.status !== 200) {
-      throw new Error(`Unable to initialize StoryGraph session: ${resp.status} ${resp.statusText}`)
+  /**
+   * Get (or re-fetch) the Cloudflare clearance cookie + user agent.
+   * FlareSolverr handles the challenge; we store the resulting cookies/UA.
+   */
+  private async ensureSession(): Promise<void> {
+    if (this.sessionCookies && this.cachedUserAgent) {
+      console.log('Using cached StoryGraph session.')
+      return // already have them
     }
 
-    const cookie = resp.headers['set-cookie']?.[0] || ''
-    if (!cookie) {
-      throw new Error('Unable to initialize StoryGraph session: no session cookie returned')
+    console.log('Fetching initial StoryGraph session via FlareSolverr...')
+    const solution = await solveWithFlareSolverr(this.baseUrl)
+
+    if (solution.status !== 200) {
+      throw new Error(
+        `Failed to obtain StoryGraph session: FlareSolverr returned ${solution.status}`
+      )
     }
 
-    this.sessionCookie = cookie
-    //console.log(`Fetched StoryGraph session cookie: ${cookie}`)
-    return cookie
+    this.sessionCookies = solution.cookies
+    this.cachedUserAgent = solution.userAgent
+
+    console.log(`StoryGraph session obtained (${this.sessionCookies.length} cookies).`)
+  }
+
+  /** Return headers suitable for all StoryGraph requests after session init. */
+  private getFlareHeaders(options?: {
+    accept?: string
+    includeCookie?: boolean
+    referer?: string
+    xRequestedWith?: boolean
+  }): Record<string, string> {
+    // Ensure we have a valid session before building headers
+    // (in practice caller should await ensureSession() first, but we guard anyway)
+    const hasSession = this.sessionCookies && this.cachedUserAgent
+    if (!hasSession) {
+      // This shouldn't happen in normal flow, but we warn:
+      console.warn('[StoryGraph] getFlareHeaders called before session init.')
+    }
+
+    const ua = this.cachedUserAgent || this.getRandomUserAgent()
+    const cookieHeader =
+      options?.includeCookie !== false && this.sessionCookies
+        ? cookiesToHeader(this.sessionCookies)
+        : ''
+
+    const headers: Record<string, string> = {
+      'Accept': options?.accept ?? 'application/json',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'User-Agent': ua,
+      'Host': 'app.thestorygraph.com',
+      'Referer': options?.referer ?? `${this.baseUrl}/`,
+      'Connection': 'keep-alive',
+      'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="120"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Fetch-Dest': options?.xRequestedWith ? 'empty' : 'document',
+      'Sec-Fetch-Mode': options?.xRequestedWith ? 'cors' : 'navigate',
+      'Sec-Fetch-Site': 'same-origin'
+    }
+
+    if (cookieHeader) {
+      headers['Cookie'] = cookieHeader
+    }
+
+    if (options?.xRequestedWith) {
+      headers['X-Requested-With'] = 'XMLHttpRequest'
+    }
+    return headers
+  }
+
+  /** Fallback UA if FlareSolverr somehow didn't give one. */
+  private getRandomUserAgent(): string {
+    const versions = ['120.0.0.0', '119.0.0.0', '118.0.0.0']
+    const version = versions[Math.floor(Math.random() * versions.length)]
+    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`
   }
 
   public async search(
@@ -62,9 +116,11 @@ export default class StoryGraphProvider extends BaseProvider {
 
     this.validateParameters(title, author, bookLimit, editionLimit, language, pubYear)
 
-    await this.getSessionCookie()
+    // Obtain session + cookies + user-agent via FlareSolverr
+    await this.ensureSession()
 
-    const searchResults = await this.searchBooksWithRetry(title, author, bookLimit)
+    const searchResults = await this.searchBooks(title, author, bookLimit)
+    console.log('found', searchResults.length, 'books for', title, author)
     if (searchResults.length === 0) {
       return []
     }
@@ -75,6 +131,7 @@ export default class StoryGraphProvider extends BaseProvider {
       language,
       pubYear
     )
+
     let allResults: BookMetadata[]
     if (editions.length > 0) {
       allResults = editions
@@ -90,7 +147,6 @@ export default class StoryGraphProvider extends BaseProvider {
         return metadata
       })
     }
-    //TODO: fetch description for each bookId and add to metadata.description
 
     if (!options?.skipCache) {
       for (const result of allResults) {
@@ -103,26 +159,6 @@ export default class StoryGraphProvider extends BaseProvider {
     return allResults
   }
 
-  async searchBooksWithRetry(title: string, author: string | null, bookLimit: number): Promise<StoryGraphSearchResult[]> {
-  const maxRetries = 3
-  let lastError: Error | null = null
-  
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      return await this.searchBooks(title, author, bookLimit)
-    } catch (error) {
-      lastError = error as Error
-      if (attempt < maxRetries - 1) {
-        const delay = 5000 * Math.pow(2, attempt) + Math.random() * 2000
-        console.log(`Attempt ${attempt + 1} failed. Retrying in ${Math.round(delay)}ms...`)
-        await new Promise(r => setTimeout(r, delay))
-      }
-    }
-  }
-  
-  throw lastError
-}
-
   private async searchBooks(
     title: string,
     author: string | null,
@@ -134,29 +170,35 @@ export default class StoryGraphProvider extends BaseProvider {
       search_term: searchString
     })
 
-    const searchUrl = `${this.searchUrl}?${searchParams.toString()}`
-    //console.log(`Fetching StoryGraph search results from: ${searchUrl}`)
+    const searchUrl = `${this.searchUrl}?${searchParams.toString()}`.replace('+', '%20')
+    console.log(`Fetching StoryGraph search results from: ${searchUrl}`)
 
-    const searchRes = await httpClient.get<string>(searchUrl, {
-      headers: this.getHeaders({
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        includeCookie: true
-      })
+    const searchRes = await fetch(searchUrl, {
+      method: 'GET',
+      headers: this.getFlareHeaders({
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }),
+      redirect: 'follow'
     })
-    // sleep for a short duration to avoid hitting rate limits
-    await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 1500))
 
-    if (searchRes.status === 404) {
-      console.warn(`No search results found for query: "${searchString}"`)
-      return []
+    // Sleep briefly to be polite
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    if (!searchRes.ok) {
+      const bodyText = await searchRes.text().catch(() => '')
+      if (searchRes.status === 404) {
+        console.warn(`No search results found for query: "${searchString}"`)
+        return []
+      }
+      console.warn('Unexpected response:', searchRes.status, searchRes.statusText)
+      if (bodyText.length < 2000) {
+        console.warn('Response body:', bodyText)
+      }
+      throw new Error(`Error while searching StoryGraph: ${searchRes.status} ${searchRes.statusText}`)
     }
-    if (searchRes.status !== 200) {
-      throw new Error(`Error while searching StoryGraph: ${searchRes.status}`)
-    }
 
-    //console.log(`Search results fetched successfully for query: "${searchString}"`)
-
-    const searchResults: StoryGraphSearchResult[] = this.parseSearchResults(searchRes.data)
+    const html = await searchRes.text()
+    const searchResults: StoryGraphSearchResult[] = this.parseSearchResults(html)
     return searchResults.slice(0, bookLimit)
   }
 
@@ -186,30 +228,6 @@ export default class StoryGraphProvider extends BaseProvider {
     return results
   }
 
-  private async fetchEditionsForBooksWithRetry(
-    bookIds: string[],
-    editionLimit: number,
-    language: string,
-    pubYear: string): Promise<BookMetadata[]> {
-  const maxRetries = 3
-  let lastError: Error | null = null
-  
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      return await this.fetchEditionsForBooks(bookIds, editionLimit, language, pubYear)
-    } catch (error) {
-      lastError = error as Error
-      if (attempt < maxRetries - 1) {
-        const delay = 5000 * Math.pow(2, attempt) + Math.random() * 2000
-        console.log(`Attempt ${attempt + 1} failed. Retrying in ${Math.round(delay)}ms...`)
-        await new Promise(r => setTimeout(r, delay))
-      }
-    }
-  }
-  
-  throw lastError
-}
-
   private async fetchEditionsForBooks(
     bookIds: string[],
     editionLimit: number,
@@ -230,34 +248,33 @@ export default class StoryGraphProvider extends BaseProvider {
       }
 
       const editionsUrl = `${this.editionsUrl}?${searchParams.toString()}`
-      //console.log(`Fetching editions for bookId ${bookId} from: ${editionsUrl}`)
 
-      const searchRes = await httpClient.get<string>(editionsUrl, {
-        headers: this.getHeaders({
+      const searchRes = await fetch(editionsUrl, {
+        headers: this.getFlareHeaders({
           accept:
             'text/javascript, application/javascript, application/ecmascript, application/x-ecmascript, */*; q=0.01',
           referer: `${this.baseUrl}/books/${bookId}/editions`,
-          xRequestedWith: true,
-          includeCookie: true
-        })
+          xRequestedWith: true
+        }),
+        redirect: 'follow'
       })
-      // sleep for a short duration to avoid hitting rate limits
-    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000))
 
-      if (searchRes.status === 404) {
-        console.warn(`No editions found for bookId: "${bookId}"`)
-        continue
-      }
-      if (searchRes.status !== 200) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      if (!searchRes.ok) {
+        if (searchRes.status === 404) {
+          console.warn(`No editions found for bookId: "${bookId}"`)
+          continue
+        }
         throw new Error(`Error while fetching editions from StoryGraph: ${searchRes.status}`)
       }
 
-      const parsedEditions = this.parseFilteredEditionsResponse(searchRes.data, pubYear)
+      const responseBody = await searchRes.text()
+      const parsedEditions = this.parseFilteredEditionsResponse(responseBody, pubYear)
       if (parsedEditions.length > 0) {
         editions.push(...parsedEditions.slice(0, editionLimit))
       }
-
-      //console.log(`Editions fetched successfully for bookId: "${bookId}"`)
+      console.log('found', parsedEditions.length, 'editions for bookId', bookId)
     }
 
     return editions
@@ -288,20 +305,23 @@ export default class StoryGraphProvider extends BaseProvider {
     const results: BookMetadata[] = []
     const seenBookIds = new Set<string>()
 
-    //extract metadata, all editions share, such as series, tags (pink) and genres (teal) from the first fragment and add to results
     const series: SeriesMetadata[] = []
     const $seriesLink = $('.book-title-author-and-series p.font-semibold a[href^="/series/"]').first()
     if ($seriesLink.length > 0) {
       const href = $seriesLink.attr('href') || ''
       const seriesName = $seriesLink.text().trim()
       if (href && seriesName) {
-        const sequence = $seriesLink.next()?.text().trim() || undefined
+        let sequence = $seriesLink.next()?.text().trim() || undefined
+        if (sequence && sequence.startsWith('#')) {
+          sequence = sequence.substring(1).trim()
+        }
         series.push({
           series: seriesName,
           sequence
         } as SeriesMetadata)
       }
     }
+
     const tags: string[] = []
     const genres: string[] = []
     $('.block.md\\:hidden.my-1.leading-4.w-\\[93\\%\\]')
@@ -316,7 +336,7 @@ export default class StoryGraphProvider extends BaseProvider {
           tags.push(text)
         }
       })
-    //extract edition specific metadata from each edition and add to results
+
     $('.book-pane').each((_, element) => {
       const pane = $(element)
       const bookId = String(pane.attr('data-book-id') || '').trim()
@@ -451,45 +471,5 @@ export default class StoryGraphProvider extends BaseProvider {
   private getConfigParam(paramName: string) {
     const configParam = this.config.parameters.find((param) => param.name === paramName)
     return configParam
-  }
-
-  private getRandomUserAgent(): string {
-    const versions = [
-      'Chrome/120.0.0.0',
-      'Chrome/119.0.0.0', 
-      'Chrome/118.0.0.0'
-    ]
-    const version = versions[Math.floor(Math.random() * versions.length)]
-    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ${version} Safari/537.36`
-  }
-
-  private getHeaders(options?: {
-    accept?: string
-    includeCookie?: boolean
-    referer?: string
-    xRequestedWith?: boolean
-  }): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Accept': options?.accept ?? 'application/json',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Sec-Ch-Ua': '"Not A(Brand";v="99", "Google Chrome";v="120"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Upgrade-Insecure-Requests': '1',
-    'Host': 'app.thestorygraph.com',
-    'User-Agent': this.getRandomUserAgent(),
-    Cookie: options?.includeCookie === false ? '' : this.sessionCookie || '',
-    Referer: options?.referer ?? 'https://www.google.com/'
-  }
-
-    if (options?.xRequestedWith) {
-      headers['X-Requested-With'] = 'XMLHttpRequest'
-    }
-
-    return headers
   }
 }
